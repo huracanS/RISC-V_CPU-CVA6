@@ -48,6 +48,9 @@ module instr_scan #(
     output logic [CVA6Cfg.VLEN-1:0] rvc_imm_o
 );
 
+  // 立即数生成函数 J-type类型指令 JAL/JALR
+  // 输入：一条 32-bit 指令
+  // 输出：扩展到 VLEN 位（通常 64 位）的有符号立即数
   function automatic logic [CVA6Cfg.VLEN-1:0] uj_imm(logic [31:0] instruction_i);
     return {
       {44 + CVA6Cfg.VLEN - 64{instruction_i[31]}},
@@ -58,6 +61,9 @@ module instr_scan #(
     };
   endfunction
 
+  // 立即数生成函数 SB类型指令
+  // 输入：一条 32-bit 指令
+  // 输出：扩展到 VLEN 位（64 或 128）的有符号立即数
   function automatic logic [CVA6Cfg.VLEN-1:0] sb_imm(logic [31:0] instruction_i);
     return {
       {51 + CVA6Cfg.VLEN - 64{instruction_i[31]}},
@@ -69,22 +75,30 @@ module instr_scan #(
     };
   endfunction
 
+  // 识别压缩的JAL指令类型
   logic rv32_rvc_jal;
   assign rv32_rvc_jal = (CVA6Cfg.XLEN == 32) & ((instr_i[15:13] == riscv::OpcodeC1Jal) & (instr_i[1:0] == riscv::OpcodeC1));
 
+  // 识别XRET（MRET/SRET/URET）指令类型
   logic is_xret;
   assign is_xret = logic'(instr_i[31:30] == 2'b00) & logic'(instr_i[28:0] == 29'b10000001000000000000001110011);
 
   // check that rs1 is either x1 or x5 and that rd is not rs1
+  // 当前指令必须是 JALR（间接跳转）,检测rs1寄存器编号是不是x1(ra)或x5(t0)，也避免rd==rs1出现jalr x1,x1无意义的情况.
   assign rvi_return_o = rvi_jalr_o & ((instr_i[19:15] == 5'd1) | instr_i[19:15] == 5'd5)
                                      & (instr_i[19:15] != instr_i[11:7]);
   // Opcode is JAL[R] and destination register is either x1 or x5
+  // 指令是JALR或JAL，如果rd寄存器编号是x1(ra)或x5(t0)，说明是调用保存返回地址.
   assign rvi_call_o = (rvi_jalr_o | rvi_jump_o) & ((instr_i[11:7] == 5'd1) | instr_i[11:7] == 5'd5);
   // differentiates between JAL and BRANCH opcode, JALR comes from BHT
+  //如果是 xRET 指令 → 立即数无意义，直接输出 0。
+  //否则：
+  //  如果 instr_i[3] == 1 → 表示是 J-type (JAL)，调用 uj_imm() 生成立即数。
+  //  如果 instr_i[3] == 0 → 表示是 B-type (branch)，调用 sb_imm() 生成立即数。
   assign rvi_imm_o = is_xret ? '0 : (instr_i[3]) ? uj_imm(instr_i) : sb_imm(instr_i);
-  assign rvi_branch_o = (instr_i[6:0] == riscv::OpcodeBranch);
-  assign rvi_jalr_o = (instr_i[6:0] == riscv::OpcodeJalr);
-  assign rvi_jump_o = logic'(instr_i[6:0] == riscv::OpcodeJal) | is_xret;
+  assign rvi_branch_o = (instr_i[6:0] == riscv::OpcodeBranch);//检测 B-type 分支指令 (BEQ/BNE/BLT/BGE/…).
+  assign rvi_jalr_o = (instr_i[6:0] == riscv::OpcodeJalr);//检测 JALR.
+  assign rvi_jump_o = logic'(instr_i[6:0] == riscv::OpcodeJal) | is_xret;//检测 JAL，或者是 XRET（返回也算一种“跳转”）.
 
   // opcode JAL
   assign rvc_jump_o   = ((instr_i[15:13] == riscv::OpcodeC1J) & (instr_i[1:0] == riscv::OpcodeC1)) | rv32_rvc_jal;

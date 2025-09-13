@@ -14,57 +14,77 @@
 //
 // This module interfaces with the instruction cache, handles control
 // change request from the back-end and does branch prediction.
+//
+// 前端模块，主要负责干三件事情：
+// 1.负责和I-Cache取指；
+// 2.处理后端发来的分支预测失败、异常、中断等信号,进行重新取指处理；
+// 3.执行分支预测逻辑，尽量保证取指令流不中断.
 
 module frontend
   import ariane_pkg::*;
 #(
-    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
-    parameter type bp_resolve_t = logic,
-    parameter type fetch_entry_t = logic,
-    parameter type icache_dreq_t = logic,
-    parameter type icache_drsp_t = logic
+    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,//CVA6的配置包
+    parameter type bp_resolve_t  = logic,//分支预测的配置类型 
+    parameter type fetch_entry_t = logic,//取指令的结构体
+    parameter type icache_dreq_t = logic,//I-Cache的请求交互数据类型
+    parameter type icache_drsp_t = logic //I-Cache的响应交互数据类型
 ) (
-    // Subsystem Clock - SUBSYSTEM
+    // 一、时钟 & 复位
     input logic clk_i,
-    // Asynchronous reset active low - SUBSYSTEM
     input logic rst_ni,
-    // Next PC when reset - SUBSYSTEM
+
+    // 二、启动 & 初始化 PC
+    // 上电/复位时CPU从哪里开始执行（复位向量地址）
     input logic [CVA6Cfg.VLEN-1:0] boot_addr_i,
-    // Flush branch prediction - zero
+
+    // 三、分支预测相关
+    // 清空分支预测器
     input logic flush_bp_i,
-    // Flush requested by FENCE, mis-predict and exception - CONTROLLER
+
+    // 四、前端flush & halt控制
+    // 来自控制器的 flush 请求（Fence、分支错误预测、异常时触发）.
     input logic flush_i,
-    // Halt requested by WFI and Accelerate port - CONTROLLER
+    // 让整个PIPE暂停（比如 WFI 或加速器请求）.
     input logic halt_i,
-    // Halt frontend - CONTROLLER (in the case of fence_i to avoid fetching an old instruction)
+    // 只 halt 前端（例如 Fence 后避免取到旧指令）.
     input logic halt_frontend_i,
-    // Set COMMIT PC as next PC requested by FENCE, CSR side-effect and Accelerate port - CONTROLLER
+
+    // 五、PC 设置（commit / 异常 / 调试）
+    // 控制器要求用 commit 阶段的 PC 作为下一个取指 PC。
     input logic set_pc_commit_i,
-    // COMMIT PC - COMMIT
+    // commit 阶段给出的 PC 值。
     input logic [CVA6Cfg.VLEN-1:0] pc_commit_i,
-    // Exception event - COMMIT
+
+    // 六、异常/分支回传
+    // commit 阶段报告有异常发生
     input logic ex_valid_i,
-    // Mispredict event and next PC - EXECUTE
+    // 执行阶段返回的分支解决结果（比如是否 mispredict 以及正确的目标 PC）。
     input bp_resolve_t resolved_branch_i,
-    // Return from exception event - CSR
+
+    // 七、CSR 相关（异常/中断/调试）
+    // CSR 通知执行 eret（从异常返回）。
     input logic eret_i,
-    // Next PC when returning from exception - CSR
+    // 从异常返回的 MEPC。
     input logic [CVA6Cfg.VLEN-1:0] epc_i,
-    // Next PC when jumping into exception - CSR
+    // 进入异常时的入口 PC（trap vector）。
     input logic [CVA6Cfg.VLEN-1:0] trap_vector_base_i,
-    // Debug event - CSR
+    // 进入调试模式时设置 PC。
     input logic set_debug_pc_i,
-    // Debug mode state - CSR
+    // 当前是否处于 debug 模式。
     input logic debug_mode_i,
-    // Handshake between CACHE and FRONTEND (fetch) - CACHES
+
+    // 八、ICache 接口（取指）
+    // 前端发给 ICache 的取指请求。
     output icache_dreq_t icache_dreq_o,
-    // Handshake between CACHE and FRONTEND (fetch) - CACHES
+    // ICache 返回给前端的响应。
     input icache_drsp_t icache_dreq_i,
-    // Handshake's data between fetch and decode - ID_STAGE
+
+    // 九、Fetch → Decode 接口
+    // DECODE阶段：前端送往 decode 的指令数据。
     output fetch_entry_t [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_o,
-    // Handshake's valid between fetch and decode - ID_STAGE
+    // DECODE阶段：表示对应端口数据有效。
     output logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_valid_o,
-    // Handshake's ready between fetch and decode - ID_STAGE
+    // DECODE阶段：decode 端准备好接收信号。
     input logic [CVA6Cfg.NrIssuePorts-1:0] fetch_entry_ready_i
 );
 
@@ -113,6 +133,9 @@ module frontend
   logic                                       replay;
   logic [                   CVA6Cfg.VLEN-1:0] replay_addr;
 
+  // 取指阶段的偏移量计算
+  // 当启用 RVC（16 位指令）时，需要计算指令在取指块中的偏移.这个偏移是用于索引压缩指令的。
+  // 比如 inst1 inst2 inst3 inst4，计算得出10，索引第3条指令.
   // shift amount
   logic [$clog2(CVA6Cfg.INSTR_PER_FETCH)-1:0] shamt;
   // address will always be 16 bit aligned, make this explicit here
@@ -157,26 +180,32 @@ module frontend
 
   logic                               serving_unaligned;
   // Re-align instructions
+  // 重新对齐指令模块
+  // 
   instr_realign #(
       .CVA6Cfg(CVA6Cfg)
   ) i_instr_realign (
       .clk_i              (clk_i),
       .rst_ni             (rst_ni),
-      .flush_i            (icache_dreq_o.kill_s2),
-      .valid_i            (icache_valid_q),
-      .serving_unaligned_o(serving_unaligned),
-      .address_i          (icache_vaddr_q),
-      .data_i             (icache_data_q),
-      .valid_o            (instruction_valid),
-      .addr_o             (addr),
-      .instr_o            (instr)
+      .flush_i            (icache_dreq_o.kill_s2),//如果流水线需要清空（例如分支预测失败或 cache flush），取消当前操作.
+      .valid_i            (icache_valid_q),       //指示从 I-Cache 取出的数据有效.
+      .serving_unaligned_o(serving_unaligned),    //是否正在处理未对齐指令.
+      .address_i          (icache_vaddr_q),       //指令的虚拟地址.
+      .data_i             (icache_data_q),        //从 I-Cache 取出的原始指令数据（可能是多条指令组合的行）.
+      .valid_o            (instruction_valid),    //输出的指令有效。
+      .addr_o             (addr),                 //输出指令对应的对齐地址
+      .instr_o            (instr)                 //对齐后的指令
   );
+
   // --------------------
   // Branch Prediction
   // --------------------
   // select the right branch prediction result
   // in case we are serving an unaligned instruction in instr[0] we need to take
   // the prediction we saved from the previous fetch
+  // 选择正确的分支预测结果
+  // 如果我们正在处理未对齐的指令（位于 instr[0]），  
+  // 那么需要使用我们在上一次取指时保存下来的预测结果
   if (CVA6Cfg.RVC) begin : gen_btb_prediction_shifted
     assign bht_prediction_shifted[0] = (serving_unaligned) ? bht_q : bht_prediction[addr[0][$clog2(
         CVA6Cfg.INSTR_PER_FETCH
